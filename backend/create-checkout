@@ -1,1 +1,96 @@
+// supabase/functions/create_checkout/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import Stripe from "npm:stripe"; // uses your account's default API version
+const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
+if (!STRIPE_SECRET_KEY) {
+  console.error("Missing STRIPE_SECRET_KEY");
+}
+const stripe = new Stripe(STRIPE_SECRET_KEY);
+/** tiny helpers */ const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS"
+};
+const json = (data, status = 200)=>new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...cors
+    }
+  });
+serve(async (req)=>{
+  if (req.method === "OPTIONS") return new Response("", {
+    headers: cors
+  });
+  if (req.method !== "POST") return json({
+    error: "Method not allowed"
+  }, 405);
+  try {
+    const body = await req.json();
+    // 1) amount
+    const amountUSD = Number(body.amountUSD ?? body.amount_usd ?? 0);
+    if (!Number.isFinite(amountUSD) || amountUSD <= 0) {
+      return json({
+        error: "amountUSD must be > 0"
+      }, 400);
+    }
+    const amountInCents = Math.round(amountUSD * 100);
+    // 2) success/cancel URLs (allow per-request override; fallback to env)
+    const successUrl = String(body.success_url ?? Deno.env.get("CHECKOUT_SUCCESS_URL") ?? "").trim();
+    const cancelUrl = String(body.cancel_url ?? Deno.env.get("CHECKOUT_CANCEL_URL") ?? "").trim();
+    const httpsRe = /^https?:\/\/.+/i;
+    if (!httpsRe.test(successUrl) || !httpsRe.test(cancelUrl)) {
+      return json({
+        error: "Provide valid https success_url and cancel_url"
+      }, 400);
+    }
+    // 3) create the Checkout Session (ACH debit)
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      currency: "usd",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "Wallet funding (ACH)"
+            },
+            unit_amount: amountInCents
+          },
+          quantity: 1
+        }
+      ],
+      payment_method_types: [
+        "us_bank_account"
+      ],
+      payment_method_options: {
+        us_bank_account: {
+          verification_method: "instant"
+        }
+      },
+      customer_creation: "always",
+      consent_collection: {
+        terms_of_service: "required"
+      },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      // Useful metadata for later reconciliation / Bridge leg
+      metadata: {
+        from_phone: String(body.from_phone ?? ""),
+        bridge_customer_id: String(body.bridge_customer_id ?? "")
+      }
+    });
+    return json({
+      url: session.url,
+      id: session.id
+    });
+  } catch (err) {
+    console.error("[create_checkout] error:", err);
+    const message = err?.raw?.message ?? err?.message ?? "Stripe error creating checkout";
+    return json({
+      error: message
+    }, 400);
+  }
+});
 
