@@ -1,0 +1,332 @@
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.46.1";
+// ---- env --------------------------------------------------------------------
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const FALLBACK_FORM_URL = Deno.env.get("FALLBACK_FORM_URL"); // e.g. https://verify.malva.company/functions/v1/fallback-form
+const WA_PERMANENT_TOKEN = Deno.env.get("WA_PERMANENT_TOKEN");
+const WABA_PHONE_ID = Deno.env.get("WABA_PHONE_ID");
+const WA_GRAPH_API_VER = Deno.env.get("WA_GRAPH_API_VERSION") ?? "v20.0";
+const WA_VERIFY_TOKEN = Deno.env.get("WA_VERIFY_TOKEN") ?? "malva-verify-token";
+// ---- supabase ---------------------------------------------------------------
+const sb = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+const W = sb.schema("whatsapp");
+// ---- helpers ----------------------------------------------------------------
+const digitsOnly = (s)=>s.replace(/\D+/g, "");
+const plusify = (digits)=>digits.startsWith("+") ? digits : `+${digits}`;
+// tolerant amount parser (ZAR)
+function parseAmountZAR(text) {
+  const raw = text.toString().trim();
+  // get digits, commas, dot
+  const cleaned = raw.replace(/[^\d.,]/g, "");
+  if (!cleaned) return null;
+  // if both , and . exist, assume . is decimal, strip commas
+  let norm = cleaned;
+  if (cleaned.includes(",") && cleaned.includes(".")) {
+    norm = cleaned.replace(/,/g, "");
+  } else if (cleaned.includes(",") && !cleaned.includes(".")) {
+    // treat comma as decimal
+    norm = cleaned.replace(",", ".");
+  }
+  const n = Number(norm);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
+}
+// Cloud API senders -----------------------------------------------------------
+const GRAPH_URL = `https://graph.facebook.com/${WA_GRAPH_API_VER}/${WABA_PHONE_ID}/messages`;
+async function waFetch(payload) {
+  const res = await fetch(GRAPH_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${WA_PERMANENT_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      ...payload
+    })
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=>"");
+    console.error("WA SEND ERROR", res.status, t);
+  }
+}
+async function sendText(toDigits, body) {
+  await logOutbound(toDigits, "text", {
+    body
+  });
+  await waFetch({
+    to: toDigits,
+    type: "text",
+    text: {
+      body,
+      preview_url: false
+    }
+  });
+}
+async function sendButtons(toDigits, text, buttons) {
+  await logOutbound(toDigits, "buttons", {
+    text,
+    buttons
+  });
+  await waFetch({
+    to: toDigits,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: {
+        text
+      },
+      action: {
+        buttons: buttons.map((b)=>({
+            type: "reply",
+            reply: {
+              id: b.id,
+              title: b.title
+            }
+          }))
+      }
+    }
+  });
+}
+// Replies ---------------------------------------------------------------------
+async function replyMenu(toDigits) {
+  await sendButtons(toDigits, "👋 Malva here — how can I help?", [
+    {
+      id: "REQ_PAYOUT",
+      title: "Request payout"
+    }
+  ]);
+}
+async function replyAskAmount(toDigits) {
+  await sendText(toDigits, "Please reply with the payout amount in *ZAR* (e.g., 600 or 600.50).");
+}
+async function replyAskConfirm(toDigits, amount) {
+  const pretty = new Intl.NumberFormat("en-ZA", {
+    style: "currency",
+    currency: "ZAR"
+  }).format(amount);
+  await sendButtons(toDigits, `Confirm payout amount: *${pretty}* ?`, [
+    {
+      id: "CONFIRM_YES",
+      title: "YES"
+    },
+    {
+      id: "CONFIRM_NO",
+      title: "NO"
+    }
+  ]);
+}
+async function replyFinishLink(toDigits, fromE164) {
+  // Your fallback form expects + in the query param
+  const link = `${FALLBACK_FORM_URL}?from=${encodeURIComponent(fromE164)}`;
+  await sendText(toDigits, `Tap to finish payout request:\n${link}\n\nWe’ll message you as soon as everything is set.`);
+}
+// DB logging ------------------------------------------------------------------
+async function logInbound(from, body) {
+  try {
+    await W.from("inbound_messages").insert({
+      from_phone: plusify(from),
+      body
+    });
+  } catch  {}
+}
+async function logOutbound(to, kind, body) {
+  try {
+    await W.from("outbound_messages").insert({
+      to_phone: plusify(to),
+      kind,
+      body
+    });
+  } catch  {}
+}
+async function getState(fromE164) {
+  const { data } = await W.from("chat_state").select("*").eq("from_phone", fromE164).maybeSingle();
+  return data ?? {
+    from_phone: fromE164,
+    stage: "awaiting_command",
+    pending_amount: null
+  };
+}
+async function setState(fromE164, patch) {
+  const cur = await getState(fromE164);
+  const next = {
+    ...cur,
+    ...patch,
+    from_phone: cur.from_phone
+  };
+  await W.from("chat_state").upsert(next, {
+    onConflict: "from_phone"
+  });
+  return next;
+}
+async function parseInbound(req) {
+  const ctype = req.headers.get("content-type") ?? "";
+  // 1) Meta Cloud API JSON
+  if (ctype.includes("application/json")) {
+    const j = await req.json().catch(()=>null);
+    if (!j) return null;
+    const change = j?.entry?.[0]?.changes?.[0]?.value;
+    const msg = change?.messages?.[0];
+    if (!msg) return null;
+    const fromDigits = msg.from; // digits per Cloud API
+    let text = "";
+    // text message
+    if (msg.type === "text") text = msg.text?.body ?? "";
+    // interactive replies (modern Cloud API shape)
+    if (msg.type === "interactive") {
+      const br = msg.interactive?.button_reply;
+      const lr = msg.interactive?.list_reply;
+      if (br?.id) text = br.id; // our button ids, e.g., REQ_PAYOUT, CONFIRM_YES
+      else if (lr?.id) text = lr.id;
+      else if (br?.title) text = br.title;
+      else if (lr?.title) text = lr.title;
+    }
+    // legacy button payload (some sandboxes surface as msg.button?.text / ?.payload)
+    if (!text && msg.button?.payload) text = msg.button.payload;
+    if (!text && msg.button?.text) text = msg.button.text;
+    return {
+      fromDigits,
+      fromE164: plusify(fromDigits),
+      text: (text ?? "").trim()
+    };
+  }
+  // 2) Local smoke test (Twilio-like urlencoded: From, Body)
+  if (ctype.includes("application/x-www-form-urlencoded")) {
+    const form = await req.formData();
+    const fromF = String(form.get("From") ?? form.get("from") ?? form.get("from_phone") ?? "");
+    const body = String(form.get("Body") ?? form.get("body") ?? "");
+    const e164 = fromF.startsWith("whatsapp:") ? fromF.substring("whatsapp:".length) : fromF;
+    const digits = digitsOnly(e164);
+    if (!digits) return null;
+    return {
+      fromDigits: digits,
+      fromE164: plusify(digits),
+      text: body.trim()
+    };
+  }
+  return null;
+}
+// -----------------------------------------------------------------------------
+serve(async (req)=>{
+  try {
+    // Meta verification handshake (GET)
+    if (req.method === "GET") {
+      const url = new URL(req.url);
+      const mode = url.searchParams.get("hub.mode");
+      const token = url.searchParams.get("hub.verify_token");
+      const challenge = url.searchParams.get("hub.challenge");
+      if (mode === "subscribe" && token === WA_VERIFY_TOKEN && challenge) {
+        return new Response(challenge, {
+          status: 200
+        });
+      }
+      return new Response("forbidden", {
+        status: 403
+      });
+    }
+    if (req.method !== "POST") return new Response("ok");
+    const parsed = await parseInbound(req);
+    if (!parsed) return new Response("ok");
+    const { fromDigits, fromE164, text } = parsed;
+    await logInbound(fromE164, {
+      text,
+      raw: await safeCloneBody(req)
+    });
+    // current state
+    let state = await getState(fromE164);
+    console.log("STATE_BEFORE", {
+      from: fromE164,
+      stage: state.stage,
+      pending_amount: state.pending_amount
+    });
+    const isReqPayout = /REQ_PAYOUT/i.test(text) || /request/i.test(text) && /payout/i.test(text);
+    const isYes = /^CONFIRM_YES$/i.test(text) || /^yes\b/i.test(text);
+    const isNo = /^CONFIRM_NO$/i.test(text) || /^no\b/i.test(text);
+    if (isReqPayout) {
+      state = await setState(fromE164, {
+        stage: "awaiting_amount",
+        pending_amount: null
+      });
+      await replyAskAmount(fromDigits);
+      console.log("STATE_AFTER", {
+        from: fromE164,
+        stage: "awaiting_amount"
+      });
+      return new Response("ok");
+    }
+    // Forgiving amount handling: accept numbers even if state drifted
+    const amountMaybe = parseAmountZAR(text);
+    if (amountMaybe != null && (state.stage === "awaiting_amount" || state.stage === "awaiting_command")) {
+      await setState(fromE164, {
+        stage: "awaiting_confirm",
+        pending_amount: amountMaybe
+      });
+      await replyAskConfirm(fromDigits, amountMaybe);
+      console.log("STATE_AFTER", {
+        from: fromE164,
+        stage: "awaiting_confirm",
+        pending_amount: amountMaybe
+      });
+      return new Response("ok");
+    }
+    // Forgiving YES/NO handling (as long as we still have a pending amount)
+    if (isYes || isNo) {
+      const latest = await getState(fromE164);
+      if (latest.pending_amount != null) {
+        if (isYes) {
+          await replyFinishLink(fromDigits, fromE164);
+          await setState(fromE164, {
+            stage: "awaiting_command",
+            pending_amount: null
+          });
+          console.log("STATE_AFTER", {
+            from: fromE164,
+            stage: "awaiting_command",
+            cleared: true
+          });
+          return new Response("ok");
+        }
+        if (isNo) {
+          await sendText(fromDigits, "Okay, cancelled. Type *request payout* to start again.");
+          await setState(fromE164, {
+            stage: "awaiting_command",
+            pending_amount: null
+          });
+          console.log("STATE_AFTER", {
+            from: fromE164,
+            stage: "awaiting_command",
+            cancelled: true
+          });
+          return new Response("ok");
+        }
+      }
+    // if we got YES/NO but no pending amount -> fall through to menu
+    }
+    // If we were waiting for confirm but user sent something else, nudge
+    if (state.stage === "awaiting_confirm") {
+      await sendText(fromDigits, "Please tap *YES* or *NO*.");
+      return new Response("ok");
+    }
+    // Default → show menu
+    await replyMenu(fromDigits);
+    return new Response("ok");
+  } catch (e) {
+    console.error("WEBHOOK_ERROR", e);
+    return new Response("ok");
+  }
+});
+// utility: capture body without consuming original req (for logs)
+async function safeCloneBody(req) {
+  try {
+    const ct = req.headers.get("content-type") ?? "";
+    if (ct.includes("application/json")) return await req.clone().json();
+    if (ct.includes("application/x-www-form-urlencoded")) {
+      const fd = await req.clone().formData();
+      const o = {};
+      for (const [k, v] of fd.entries())o[k] = v;
+      return o;
+    }
+  } catch  {}
+  return null;
+}
