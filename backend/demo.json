@@ -1,0 +1,19 @@
+{
+  "customer": {
+    "full_name": "John Doe",
+    "email": "john.doe@example.com",
+    "country": "US"
+  },
+  "payment": {
+    "currency": "USD",
+    "amount": 200,
+    "destination_country": "ZA",
+    "destination_currency": "ZAR"
+  },
+  "payout_details": {
+    "full_name": "Sipho Mokoena",
+    "bank_name": "Capitec Bank",
+    "account_number": "1328492138",
+    "account_type": "checking"
+  }
+}
