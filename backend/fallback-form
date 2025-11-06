@@ -1,1 +1,164 @@
+// supabase/functions/fallback-form/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+/** Build a full HTML page */ function page(body, headExtra = "") {
+  return new Response(`<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Add payout details • Malva</title>
+<style>
+  :root{--bg:#0b0c0f;--card:#12151b;--ink:#e9eef4;--muted:#9fb0c3;--line:#1e2430;--field:#0e1117;--brand:#27ae60}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
+  .wrap{max-width:680px;margin:32px auto;padding:24px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+  .hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .logo{width:28px;height:28px;border-radius:7px;background:var(--brand)}
+  h1{font-size:22px;margin:6px 0 12px}
+  p.hint{margin:6px 0 18px;color:var(--muted)}
+  label{display:block;margin:14px 0 6px;font-weight:600}
+  input,select{width:100%;padding:12px;border-radius:8px;border:1px solid var(--line);background:var(--field);color:var(--ink)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  button{margin-top:18px;width:100%;padding:12px 16px;border:0;border-radius:10px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}
+  .ok{padding:18px;background:#0e1912;border:1px solid #1c3526;border-radius:10px}
+  .err{padding:18px;background:#190e0e;border:1px solid #351c1c;border-radius:10px}
+  code.small{font-size:12px;color:var(--muted)}
+</style>${headExtra}
+</head><body><div class="wrap">${body}</div></body></html>`, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8"
+    }
+  });
+}
+/** Resolve orchestrator URL from env or current origin */ function resolveOrchUrl(req) {
+  const envUrl = Deno.env.get("ORCH_EXTERNAL_ACCOUNT_URL")?.trim();
+  if (envUrl) return envUrl;
+  const u = new URL(req.url);
+  return `${u.origin}/functions/v1/bridge-orch/external-account`;
+}
+serve(async (req)=>{
+  const url = new URL(req.url);
+  if (req.method === "GET") {
+    const from = url.searchParams.get("from") ?? ""; // optional: +27...
+    const rid = url.searchParams.get("request_id") ?? ""; // optional: link PR
+    const body = `
+      <div class="hdr"><div class="logo"></div><div><div style="font-weight:700">Malva</div>
+      <div style="color:var(--muted);font-size:13px">Compliant cross-border payouts</div></div></div>
+      <h1>Add payout details</h1>
+      <p class="hint">We’ll pay out in ZAR to the account you provide. Your details are encrypted in transit and kept private.</p>
+
+      <form method="POST">
+        <input type="hidden" name="from_phone" value="${from}"/>
+        <input type="hidden" name="request_id" value="${rid}"/>
+
+        <div class="row">
+          <div>
+            <label>Country</label>
+            <select name="country" required>
+              <option value="ZA" selected>South Africa (ZA)</option>
+            </select>
+          </div>
+          <div>
+            <label>Currency</label>
+            <select name="currency" required>
+              <option value="ZAR" selected>ZAR</option>
+            </select>
+          </div>
+        </div>
+
+        <label>Full name</label>
+        <input name="account_holder_name" placeholder="e.g. Thando Mkhize" required>
+
+        <label>Bank</label>
+        <select name="bank_name" required>
+          <option value="" disabled selected>Select bank…</option>
+          <option>FNB</option><option>Absa</option><option>Standard Bank</option>
+          <option>Nedbank</option><option>Capitec</option><option>TymeBank</option>
+          <option>Discovery Bank</option><option>Other</option>
+        </select>
+
+        <label>Account number</label>
+        <input name="account_number" inputmode="numeric" required>
+
+        <div class="row">
+          <div>
+            <label>Account type</label>
+            <select name="account_type" required>
+              <option value="cheque_current" selected>Cheque / Current</option>
+              <option value="savings">Savings</option>
+            </select>
+          </div>
+          <div>
+            <label>Branch code (6 digits)</label>
+            <input name="branch_code" pattern="\\d{6}" placeholder="e.g. 250655" required>
+          </div>
+        </div>
+
+        <label>SWIFT/BIC (optional)</label>
+        <input name="swift_bic" placeholder="e.g. FIRNZAJJXXX">
+
+        <label>Payment reference (optional)</label>
+        <input name="reference" maxlength="30" placeholder="Shown on your statement">
+
+        <button type="submit">Submit details</button>
+        <p class="hint" style="margin-top:10px"><code class="small">You can close this tab after submitting.</code></p>
+      </form>
+    `;
+    return page(body);
+  }
+  if (req.method === "POST") {
+    try {
+      const form = await req.formData();
+      // Build the normalized payload your orchestrator expects
+      const payload = {
+        from_phone: (form.get("from_phone") ?? "").toString(),
+        request_id: (form.get("request_id") ?? "").toString(),
+        normalized_external_account: {
+          country: (form.get("country") ?? "ZA").toString().toUpperCase(),
+          currency: (form.get("currency") ?? "ZAR").toString().toUpperCase(),
+          account_holder_name: (form.get("account_holder_name") ?? "").toString(),
+          bank_name: (form.get("bank_name") ?? "").toString(),
+          account_number: (form.get("account_number") ?? "").toString(),
+          branch_code: (form.get("branch_code") ?? "").toString(),
+          swift_bic: (form.get("swift_bic") ?? "").toString(),
+          iban: undefined,
+          account_type: (form.get("account_type") ?? "").toString(),
+          reference: (form.get("reference") ?? "").toString(),
+          beneficiary_address: undefined,
+          _source: "fallback-form",
+          _raw: Object.fromEntries(form.entries())
+        }
+      };
+      const orchUrl = resolveOrchUrl(req);
+      const r = await fetch(orchUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        const body = `<div class="err">
+          <h1>We hit a hiccup</h1>
+          <p class="hint">Your details weren’t saved. Please try again shortly.</p>
+          <pre style="white-space:pre-wrap">${(txt || "Unknown error").slice(0, 2000)}</pre>
+        </div>`;
+        return page(body);
+      }
+      const body = `<div class="ok">
+        <h1>✅ Details received</h1>
+        <p class="hint">Thanks! We’ll notify you in WhatsApp when funds are on the way.</p>
+      </div>`;
+      return page(body);
+    } catch (e) {
+      const body = `<div class="err">
+        <h1>Unexpected error</h1>
+        <pre style="white-space:pre-wrap">${String(e)}</pre>
+      </div>`;
+      return page(body);
+    }
+  }
+  return new Response("Method not allowed", {
+    status: 405
+  });
+});
 
