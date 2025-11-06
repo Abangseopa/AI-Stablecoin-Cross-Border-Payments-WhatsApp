@@ -1,1 +1,0 @@
-web: java -Dserver.port=$PORT $JAVA_OPTS -jar target/crossborderbackend-1.0-SNAPSHOT.jar 
