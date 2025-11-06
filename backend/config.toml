@@ -1,0 +1,10 @@
+# config.toml
+
+[functions]
+verify_jwt = true
+
+[functions.bridge-webhook]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
