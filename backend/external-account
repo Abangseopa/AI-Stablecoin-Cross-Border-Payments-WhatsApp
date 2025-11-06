@@ -1,1 +1,70 @@
+// supabase/functions/external-account/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+function withCORS(res) {
+  const h = new Headers(res.headers);
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Access-Control-Allow-Headers", "authorization, x-client-info, apikey, content-type");
+  h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  return new Response(res.body, {
+    status: res.status,
+    headers: h
+  });
+}
+const json = (s, b)=>withCORS(new Response(JSON.stringify(b), {
+    status: s,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  }));
+serve(async (req)=>{
+  if (req.method === "OPTIONS") return withCORS(new Response(null, {
+    status: 204
+  }));
+  if (req.method === "GET") return json(200, {
+    ok: true,
+    service: "external-account"
+  });
+  if (req.method !== "POST") return json(405, {
+    error: "method_not_allowed"
+  });
+  let data;
+  try {
+    data = await req.json();
+  } catch  {
+    return json(400, {
+      error: "bad_json"
+    });
+  }
+  const n = data?.normalized_external_account ?? data ?? {};
+  const rec = {
+    from_phone: data.from_phone ?? null,
+    country: (n.country ?? "ZA")?.toUpperCase(),
+    currency: (n.currency ?? "ZAR")?.toUpperCase(),
+    account_holder_name: n.account_holder_name ?? null,
+    bank_name: n.bank_name ?? null,
+    account_number: n.account_number ?? null,
+    branch_code: n.branch_code ?? null,
+    swift_bic: n.swift_bic ?? null,
+    iban: n.iban ?? null,
+    account_type: n.account_type ?? null,
+    reference: n.reference ?? null,
+    beneficiary_address: n.beneficiary_address ?? null,
+    raw_json: n
+  };
+  // Try saving if a table exists; ignore failures so the form still succeeds.
+  try {
+    const { error } = await sb.from("external_accounts").insert(rec);
+    if (error) console.log("Insert skipped/failed:", error.message);
+  } catch (e) {
+    console.log("Insert error:", e.message);
+  }
+  return json(200, {
+    ok: true
+  });
+});
 
