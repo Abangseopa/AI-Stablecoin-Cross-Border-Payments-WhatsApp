@@ -1,1 +1,514 @@
+// supabase/functions/bridge-kyc-link/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/* ========= ENV ========= */ const BRIDGE_BASE_URL = Deno.env.get("BRIDGE_BASE_URL") || "https://api.bridge.xyz/v0";
+const BRIDGE_API_KEY = Deno.env.get("BRIDGE_API_KEY");
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+/** ZA branding toggles (logos optional; emoji fallback) */ const SPRINGBOKS_LOGO_URL = (Deno.env.get("SPRINGBOKS_LOGO_URL") || "").trim();
+const BAFANA_LOGO_URL = (Deno.env.get("BAFANA_LOGO_URL") || "").trim();
+// knobs (unchanged behavior)
+const PAYMENT_RAIL = (Deno.env.get("BRIDGE_PAYMENT_RAIL") || "solana").toLowerCase();
+const STABLECOIN = (Deno.env.get("BRIDGE_STABLECOIN") || "usdc").toLowerCase();
+/* ========= Supabase ========= */ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+/* ========= Helpers ========= */ function json(status = 200, body = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  });
+}
+function html(markup, status = 200) {
+  return new Response(markup, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff"
+    }
+  });
+}
+/** HARD-LOCK: always build base as <origin>/functions/v1/bridge-kyc-link */ function appBase(req) {
+  const u = new URL(req.url);
+  const origin = u.origin.startsWith("http://") ? "https://" + u.origin.slice(7) : u.origin;
+  return `${origin}/functions/v1/bridge-kyc-link`;
+}
+function idFromPath(re, path) {
+  return path.match(re)?.[1];
+}
+async function bridgeGET(path) {
+  const r = await fetch(`${BRIDGE_BASE_URL}${path}`, {
+    headers: {
+      "Api-Key": BRIDGE_API_KEY,
+      "Content-Type": "application/json"
+    }
+  });
+  if (!r.ok) throw new Error(`Bridge ${path} ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+async function bridgeCreateKycLink(payload) {
+  const r = await fetch(`${BRIDGE_BASE_URL}/kyc_links`, {
+    method: "POST",
+    headers: {
+      "Api-Key": BRIDGE_API_KEY,
+      "Content-Type": "application/json",
+      "Idempotency-Key": crypto.randomUUID()
+    },
+    body: JSON.stringify(payload)
+  });
+  const txt = await r.text();
+  let data;
+  try {
+    data = JSON.parse(txt);
+  } catch  {}
+  if (r.ok) return data;
+  if (data && (data.code === "duplicate_record" || data.existing_kyc_link)) {
+    const ek = data.existing_kyc_link || data;
+    return {
+      id: ek.id,
+      kyc_link: ek.kyc_link,
+      tos_link: ek.tos_link,
+      kyc_status: ek.kyc_status ?? "pending",
+      customer_id: ek.customer_id ?? null,
+      tos_status: ek.tos_status ?? "pending",
+      email: ek.email ?? payload.email,
+      full_name: ek.full_name ?? payload.full_name
+    };
+  }
+  throw new Error(`Bridge /kyc_links ${r.status}: ${txt}`);
+}
+/* ========= ZA Brand UI (visuals & copy only) ========= */ const baseCSS = `
+  :root{
+    /* South Africa flag palette */
+    --flag-green:#007a4d; --flag-gold:#ffb612; --flag-black:#0b0b0b; --flag-white:#ffffff;
+    --flag-red:#de3831; --flag-blue:#002395;
+    /* UI */
+    --bg:#0a0e14; --panel:#0f1420; --panel2:#0c111b; --border:#1c2433; --muted:#aab7cc; --text:#f2f6ff;
+    --brand1:var(--flag-green); --brand2:var(--flag-gold);
+    --ok:#1ec28b; --warn:#ffb4a1;
+  }
+  *{box-sizing:border-box}  body{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:var(--bg);color:var(--text)}
+  .wrap{max-width:860px;margin:0 auto;padding:28px 20px}
+  .topbar{
+    display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border);
+    background:linear-gradient(90deg,var(--flag-green),var(--flag-gold),var(--flag-red),var(--flag-blue));
+    background-size:300% 100%; animation:shine 12s linear infinite;
+  }
+  @keyframes shine{0%{background-position:0% 50%}100%{background-position:100% 50%}}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px}
+  .brand .wordmark{font-size:18px}
+  .badge-za{display:flex;align-items:center;gap:8px;color:var(--text);font-size:13px;font-weight:600}
+  .badge-za .flag{font-size:16px}
+  .badges{display:flex;align-items:center;gap:12px}
+  .badge-img{height:24px;width:auto;border-radius:4px;background:#fff;padding:2px;border:1px solid rgba(0,0,0,.15)}
+  h1{font-size:24px;margin:18px 0 10px}  p{color:var(--muted);line-height:1.7}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:20px}
+  .button,button{display:inline-flex;align-items:center;gap:8px;padding:12px 16px;border-radius:10px;border:1px solid var(--border);
+    background:linear-gradient(180deg,var(--brand1),var(--brand2));color:#1a1a1a;text-decoration:none;cursor:pointer;font-weight:700}
+  .button.neutral,button.neutral{background:linear-gradient(180deg,#13213a,#0e172a);color:#fff;border-color:#2a3952}
+  label{color:var(--text);font-size:14px}
+  input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:#fff;margin-top:6px}
+  .grid{display:grid;gap:12px}
+  .trust{display:grid;gap:10px;margin-top:14px}
+  .trust .row{display:flex;gap:10px;align-items:flex-start;color:var(--muted);font-size:13px}
+  .trust .row svg{width:16px;height:16px;flex:0 0 16px}
+  .kv{display:grid;grid-template-columns:220px 1fr;gap:10px;border-bottom:1px dashed var(--border);padding:10px 0}
+  .kv:last-child{border-bottom:none}
+  .k{color:var(--muted)} .v{font-family:ui-monospace,Menlo,Consolas,monospace}
+  .copy{font-size:12px;border:1px solid var(--border);background:#0b1220;border-radius:8px;padding:4px 8px;margin-left:8px;cursor:pointer;color:#fff}
+  .small{font-size:12px;color:var(--muted)}
+  .footer{margin:24px 0 0;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .subtitle{color:#dce6ff;margin-top:4px}
+`;
+function BrandBar() {
+  const spring = SPRINGBOKS_LOGO_URL ? `<img class="badge-img" src="${SPRINGBOKS_LOGO_URL}" alt="Springboks">` : `<span title="Springboks">🦌</span>`;
+  const bafana = BAFANA_LOGO_URL ? `<img class="badge-img" src="${BAFANA_LOGO_URL}" alt="Bafana Bafana">` : `<span title="Bafana Bafana">⚽️</span>`;
+  return `
+  <div class="topbar">
+    <div class="brand">
+      <span class="wordmark">Malva</span>
+      <span class="subtitle">Built for South Africans</span>
+    </div>
+    <div class="badges">
+      <div class="badge-za"><span class="flag">🇿🇦</span><span>Send & receive worldwide</span></div>
+      ${spring}${bafana}
+    </div>
+  </div>`;
+}
+function TrustPanel() {
+  return `
+  <div class="trust">
+    <div class="row">
+      <svg viewBox="0 0 24 24" fill="#1ec28b"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>
+      <span>FICA-style identity checks and bank-grade encryption.</span>
+    </div>
+    <div class="row">
+      <svg viewBox="0 0 24 24" fill="#ffb612"><path d="M12 2 3 7v7c0 5 4.5 8 9 8s9-3 9-8V7l-9-5Zm0 2.2L19 8v6.1c0 3.6-3.2 5.9-7 5.9s-7-2.3-7-5.9V8l7-3.8Z"/></svg>
+      <span>We never sell personal information. POPIA-aligned practices.</span>
+    </div>
+    <div class="row">
+      <svg viewBox="0 0 24 24" fill="#002395"><path d="M12 4a8 8 0 0 0-8 8h3l-4 5-4-5h3a10 10 0 1 1 10 10v-2a8 8 0 0 0 0-16Z"/></svg>
+      <span>Clear, localised instructions for SA users and banks.</span>
+    </div>
+  </div>`;
+}
+function PageShell(inner) {
+  return `<!doctype html><html lang="en"><head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Malva • South Africa</title><style>${baseCSS}</style>
+  <script>function copyText(t){navigator.clipboard.writeText(t).then(()=>alert('Copied'));}</script>
+</head><body>${BrandBar()}<div class="wrap">${inner}
+  <div class="footer"><span>© ${new Date().getFullYear()} Malva</span><span>Made for South Africans</span></div>
+</div></body></html>`;
+}
+/* ==== Views (content only; actions/paths unchanged) ==== */ function viewCollectInfo(pr, base) {
+  const action = `${base}/pay/${pr.id}/start-kyc`;
+  const inner = `
+    <h1>Verify your details</h1>
+    <p>We’ll set up a secure settlement account so you can pay a recipient in South Africa, fast.</p>
+    <div class="card">
+      <form method="POST" action="${action}" class="grid" style="max-width:480px">
+        <label>Full name<input name="full_name" required/></label>
+        <label>Email<input name="email" type="email" required/></label>
+        <div><button class="button" type="submit">Continue</button></div>
+      </form>
+      <p class="small" style="margin-top:10px">Request ID: <span class="v">${pr.id}</span></p>
+    </div>
+    ${TrustPanel()}
+  `;
+  return PageShell(inner);
+}
+function viewTos(pr, base, warn = false) {
+  const cont = `${base}/pay/${pr.id}/continue-to-kyc`;
+  const inner = `
+    <h1>Review & accept terms</h1>
+    <p>To protect you and your recipient, please review the terms, then continue to verification.</p>
+    <div class="card">
+      <a class="button" href="${pr.tos_link}" target="_blank" rel="noopener">Open terms</a>
+      ${warn ? `<p class="small" style="color:var(--warn);margin-top:12px">
+        We don’t see your acceptance yet. Accept in the other tab, then click Continue.</p>` : ""}
+      <form method="POST" action="${cont}" style="margin-top:12px">
+        <button class="button neutral" type="submit">Continue</button>
+      </form>
+    </div>
+    ${TrustPanel()}
+  `;
+  return PageShell(inner);
+}
+function viewDone(pr, base) {
+  const next = `${base}/pay/${pr.id}/wallet`;
+  const inner = `
+    <h1>You're verified 🎉</h1>
+    <p class="subtitle">Great — your identity is confirmed. Next we’ll set up your secure account.</p>
+    <div class="card">
+      <div class="kv"><div class="k">Verification status</div><div><span class="v">${pr.kyc_status}</span></div></div>
+      <div class="kv"><div class="k">Customer reference</div><div class="v">${pr.payer_bridge_customer_id || "-"}</div></div>
+      <div style="margin-top:12px"><a class="button" href="${next}">Continue</a></div>
+    </div>
+    ${TrustPanel()}
+  `;
+  return PageShell(inner);
+}
+function viewWallet(pr, base, opts) {
+  const post = `${base}/pay/${pr.id}/wallet`;
+  const funding = `${base}/pay/${pr.id}/funding`;
+  const inner = `
+    <h1>Secure account setup</h1>
+    ${opts.hasWallet ? `<div class="card"><p>Your secure account is ready.</p>
+         <p><a class="button" href="${funding}">Get payment instructions</a></p></div>` : `<div class="card"><p>We’ll create a secure account for this payment. This helps clear and allocate your funds correctly.</p>
+         <form method="POST" action="${post}"><button class="button" type="submit">Set up account</button></form></div>`}
+    ${TrustPanel()}
+  `;
+  return PageShell(inner);
+}
+function viewFunding(pr, deposit) {
+  const d = deposit || {};
+  const currency = (d.currency || pr?.currency || "usd").toUpperCase();
+  const routing = d.bank_routing_number || d.routing_number || "-";
+  const account = d.bank_account_number || d.account_number || "-";
+  const bank = d.bank_name || "-";
+  const baddr = d.bank_address || "-";
+  const bname = d.bank_beneficiary_name || "-";
+  const bbenadr = d.bank_beneficiary_address || "-";
+  const rails = Array.isArray(d.payment_rails) ? d.payment_rails.join(", ") : d.payment_rail || "-";
+  const inner = `
+    <h1>Payment instructions (South Africa)</h1>
+    <p>Make a domestic transfer using the details below. Once received, we’ll allocate the funds to your payment for your South African recipient — no extra steps needed.</p>
+    <div class="card">
+      <div class="kv"><div class="k">Currency</div><div class="v">${currency}</div></div>
+      <div class="kv"><div class="k">Bank name</div><div class="v">${bank}</div></div>
+      <div class="kv"><div class="k">Bank address</div><div class="v">${baddr}</div></div>
+      <div class="kv"><div class="k">Routing number</div><div class="v">${routing}<button class="copy" onclick="copyText('${routing}')">Copy</button></div></div>
+      <div class="kv"><div class="k">Account number</div><div class="v">${account}<button class="copy" onclick="copyText('${account}')">Copy</button></div></div>
+      <div class="kv"><div class="k">Beneficiary name</div><div class="v">${bname}</div></div>
+      <div class="kv"><div class="k">Beneficiary address</div><div class="v">${bbenadr}</div></div>
+      <div class="kv"><div class="k">Supported rails</div><div class="v">${rails}</div></div>
+    </div>
+    <p class="small" style="margin-top:10px">Tip: If your bank’s teller asks, this is a standard domestic transfer. Keep these details private.</p>
+    ${TrustPanel()}
+  `;
+  return PageShell(inner);
+}
+/* ========= Customer + Wallet + VA helpers (unchanged) ========= */ async function upsertCustomerFromKyc(pr) {
+  const kyc = pr.kyc_link_id ? await bridgeGET(`/kyc_links/${pr.kyc_link_id}`) : null;
+  const email = (kyc?.email || "").toString().trim();
+  const full_name = (kyc?.full_name || "Payer").toString().trim();
+  const bridge_customer_id = pr.payer_bridge_customer_id || kyc?.customer_id || null;
+  if (!email || !bridge_customer_id) throw new Error("Missing email or Bridge customer id to create customer");
+  let { data: existingByBridge } = await sb.from("customers").select("*").eq("bridge_customer_id", bridge_customer_id).maybeSingle();
+  if (existingByBridge) {
+    const { data: updated } = await sb.from("customers").update({
+      full_name,
+      email,
+      kyc_status: pr.kyc_status || "approved",
+      type: "individual",
+      updated_at: new Date().toISOString()
+    }).eq("id", existingByBridge.id).select("*").single();
+    return updated;
+  }
+  let { data: existingByEmail } = await sb.from("customers").select("*").eq("email", email).maybeSingle();
+  if (existingByEmail) {
+    const { data: updated } = await sb.from("customers").update({
+      full_name,
+      bridge_customer_id,
+      kyc_status: pr.kyc_status || "approved",
+      type: "individual",
+      updated_at: new Date().toISOString()
+    }).eq("id", existingByEmail.id).select("*").single();
+    return updated;
+  }
+  const { data: inserted, error } = await sb.from("customers").insert({
+    full_name,
+    email,
+    type: "individual",
+    bridge_customer_id,
+    kyc_status: pr.kyc_status || "approved"
+  }).select("*").single();
+  if (error) throw error;
+  return inserted;
+}
+async function ensureWallet(customer, chain = "solana") {
+  if (customer.wallet_id) return {
+    id: customer.wallet_id,
+    chain: customer.wallet_chain || chain
+  };
+  const r = await fetch(`${BRIDGE_BASE_URL}/customers/${customer.bridge_customer_id}/wallets`, {
+    method: "POST",
+    headers: {
+      "Api-Key": BRIDGE_API_KEY,
+      "Content-Type": "application/json",
+      "Idempotency-Key": crypto.randomUUID()
+    },
+    body: JSON.stringify({
+      chain
+    })
+  });
+  const txt = await r.text();
+  let wallet;
+  try {
+    wallet = JSON.parse(txt);
+  } catch  {}
+  if (!r.ok) throw new Error(`Bridge /customers/:id/wallets ${r.status}: ${txt}`);
+  await sb.from("customers").update({
+    wallet_id: wallet.id,
+    wallet_chain: wallet.chain || chain,
+    updated_at: new Date().toISOString()
+  }).eq("id", customer.id);
+  return wallet;
+}
+async function ensureVirtualAccount(pr, customer, wallet) {
+  if (pr.deposit_instructions) {
+    try {
+      return typeof pr.deposit_instructions === "string" ? JSON.parse(pr.deposit_instructions) : pr.deposit_instructions;
+    } catch  {
+      return pr.deposit_instructions;
+    }
+  }
+  const srcCurrency = (pr.currency || "USD").toString().toLowerCase();
+  const r = await fetch(`${BRIDGE_BASE_URL}/customers/${customer.bridge_customer_id}/virtual_accounts`, {
+    method: "POST",
+    headers: {
+      "Api-Key": BRIDGE_API_KEY,
+      "Content-Type": "application/json",
+      "Idempotency-Key": crypto.randomUUID()
+    },
+    body: JSON.stringify({
+      source: {
+        currency: srcCurrency
+      },
+      destination: {
+        payment_rail: PAYMENT_RAIL,
+        currency: STABLECOIN,
+        bridge_wallet_id: wallet.id
+      }
+    })
+  });
+  const txt = await r.text();
+  let va;
+  try {
+    va = JSON.parse(txt);
+  } catch  {}
+  if (!r.ok) throw new Error(`Bridge /customers/:id/virtual_accounts ${r.status}: ${txt}`);
+  const deposit = va.source_deposit_instructions || va.deposit_instructions || va.source?.deposit_instructions || va;
+  await sb.from("payment_requests").update({
+    deposit_instructions: deposit,
+    updated_at: new Date().toISOString()
+  }).eq("id", pr.id);
+  return deposit;
+}
+/* ========= Server (routes & logic unchanged) ========= */ serve(async (req)=>{
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+      }
+    });
+  }
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const base = appBase(req);
+  try {
+    if (req.method === "POST" && /\/create-paylink$/.test(path)) {
+      const body = await req.json().catch(()=>({}));
+      const amount = body.amount ?? "1.00";
+      const currency = body.currency ?? "USD";
+      const description = body.memo ?? null;
+      const { data, error } = await sb.from("payment_requests").insert({
+        amount,
+        currency,
+        description
+      }).select("*").single();
+      if (error) return json(500, {
+        error: error.message
+      });
+      const payUrl = `${base}/pay/${data.id}`;
+      return json(200, {
+        id: data.id,
+        paylink: payUrl
+      });
+    }
+    if (req.method === "GET" && /\/pay\/[^/]+$/.test(path)) {
+      const prId = path.split("/").pop();
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr) return html("<h1>Not Found</h1>", 404);
+      return html(viewCollectInfo(pr, base));
+    }
+    if (req.method === "POST" && /\/pay\/[^/]+\/start-kyc$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/start-kyc$/, path);
+      const form = await req.formData();
+      const full_name = (form.get("full_name") || "Payer").toString();
+      const email = (form.get("email") || "").toString().trim();
+      if (!email) return json(400, {
+        error: "Email is required"
+      });
+      const kyc = await bridgeCreateKycLink({
+        full_name,
+        email,
+        type: "individual"
+      });
+      await sb.from("payment_requests").update({
+        kyc_link_id: kyc.id,
+        kyc_link: kyc.kyc_link,
+        tos_link: kyc.tos_link,
+        kyc_status: kyc.kyc_status ?? "pending",
+        payer_bridge_customer_id: kyc.customer_id ?? null
+      }).eq("id", prId);
+      if ((kyc.kyc_status === "approved" || kyc.kyc_status === "completed") && kyc.customer_id) {
+        return Response.redirect(`${base}/pay/${prId}/done`, 302);
+      }
+      return Response.redirect(`${base}/pay/${prId}/tos`, 302);
+    }
+    if (req.method === "GET" && /\/pay\/[^/]+\/tos$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/tos$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr?.kyc_link_id) return html("<h1>Not found</h1>", 404);
+      const kyc = await bridgeGET(`/kyc_links/${pr.kyc_link_id}`).catch(()=>null);
+      if (kyc) {
+        await sb.from("payment_requests").update({
+          kyc_status: kyc.kyc_status ?? pr.kyc_status,
+          payer_bridge_customer_id: kyc.customer_id ?? pr.payer_bridge_customer_id
+        }).eq("id", prId);
+        if ((kyc.kyc_status === "approved" || kyc.kyc_status === "completed") && kyc.customer_id) {
+          return Response.redirect(`${base}/pay/${prId}/done`, 302);
+        }
+      }
+      return html(viewTos(pr, base));
+    }
+    if (req.method === "POST" && /\/pay\/[^/]+\/continue-to-kyc$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/continue-to-kyc$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr?.kyc_link_id) return html("<h1>Not found</h1>", 404);
+      const kyc = await bridgeGET(`/kyc_links/${pr.kyc_link_id}`);
+      const tosAccepted = [
+        "accepted",
+        "approved",
+        "completed"
+      ].includes(kyc.tos_status);
+      await sb.from("payment_requests").update({
+        kyc_status: kyc.kyc_status ?? pr.kyc_status,
+        payer_bridge_customer_id: kyc.customer_id ?? pr.payer_bridge_customer_id
+      }).eq("id", prId);
+      if (!tosAccepted) return html(viewTos(pr, base, true));
+      return Response.redirect(pr.kyc_link, 302);
+    }
+    if (req.method === "GET" && /\/pay\/[^/]+\/done$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/done$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr) return html("<h1>Not found</h1>", 404);
+      if (pr.kyc_status === "approved" && pr.payer_bridge_customer_id) {
+        return html(viewDone(pr, base));
+      }
+      return html(`<h1>Almost there</h1><p>We don’t see an approved verification yet.</p><p><a href="${base}/pay/${prId}/tos">Continue</a></p>`);
+    }
+    // Wallet step (labels only changed)
+    if (req.method === "GET" && /\/pay\/[^/]+\/wallet$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/wallet$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr) return html("<h1>Not found</h1>", 404);
+      if (pr.kyc_status !== "approved" || !pr.payer_bridge_customer_id) {
+        const back = `${base}/pay/${prId}/tos`;
+        return html(`<h1>Waiting for verification…</h1><p><a href="${back}">Back</a></p>`);
+      }
+      const customer = await upsertCustomerFromKyc(pr);
+      if (customer.wallet_id) return html(viewWallet(pr, base, {
+        hasWallet: true
+      }));
+      return html(viewWallet(pr, base, {
+        hasWallet: false
+      }));
+    }
+    if (req.method === "POST" && /\/pay\/[^/]+\/wallet$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/wallet$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr) return html("<h1>Not found</h1>", 404);
+      if (pr.kyc_status !== "approved" || !pr.payer_bridge_customer_id) {
+        return html("<h1>Verification not approved yet</h1>", 400);
+      }
+      const customer = await upsertCustomerFromKyc(pr);
+      await ensureWallet(customer, "solana");
+      return Response.redirect(`${base}/pay/${prId}/wallet`, 302);
+    }
+    // Funding step (unchanged behavior)
+    if (req.method === "GET" && /\/pay\/[^/]+\/funding$/.test(path)) {
+      const prId = idFromPath(/\/pay\/([^/]+)\/funding$/, path);
+      const { data: pr, error } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      if (error || !pr) return html("<h1>Not found</h1>", 404);
+      if (pr.kyc_status !== "approved" || !pr.payer_bridge_customer_id) {
+        return html(`<h1>Waiting for verification…</h1><p><a href="${appBase(req)}/pay/${prId}/tos">Back</a></p>`);
+      }
+      const customer = await upsertCustomerFromKyc(pr);
+      const wallet = await ensureWallet(customer, "solana");
+      const deposit = await ensureVirtualAccount(pr, customer, wallet);
+      const { data: pr2 } = await sb.from("payment_requests").select("*").eq("id", prId).single();
+      return html(viewFunding(pr2 || pr, deposit));
+    }
+    return html(`<!doctype html><pre style="white-space:pre-wrap">Not Found\npath:${path}</pre>`, 404);
+  } catch (e) {
+    return html(`<!doctype html><pre style="white-space:pre-wrap;color:var(--warn);padding:16px">${String(e)}</pre>`, 500);
+  }
+});
 
