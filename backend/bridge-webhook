@@ -1,1 +1,181 @@
+// supabase/functions/bridge-webhook/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { createClient } from "npm:@supabase/supabase-js";
+/* ===== ENV ===== */ const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const RAW_PEM = Deno.env.get("BRIDGE_WEBHOOK_PUBLIC_KEY") || "";
+const DEBUG = Deno.env.get("BRIDGE_DEBUG") === "1";
+/* ===== Supabase ===== */ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+/* ===== PEM + crypto helpers ===== */ function normalizePem(pem) {
+  // If it already has header/footer, just trim.
+  const s = (pem || "").trim();
+  if (s.includes("-----BEGIN PUBLIC KEY-----")) return s;
+  // If a single-line blob was pasted, rebuild a valid PEM.
+  const body = s.replace(/\s+/g, "");
+  return `-----BEGIN PUBLIC KEY-----\n${body}\n-----END PUBLIC KEY-----\n`;
+}
+function pemToArrayBuffer(pem) {
+  const b64 = pem.replace(/-----BEGIN PUBLIC KEY-----/g, "").replace(/-----END PUBLIC KEY-----/g, "").replace(/\s+/g, "");
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++)buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+async function importRsaKey(pem) {
+  const fixed = normalizePem(pem);
+  return crypto.subtle.importKey("spki", pemToArrayBuffer(fixed), {
+    name: "RSASSA-PKCS1-v1_5",
+    hash: "SHA-256"
+  }, false, [
+    "verify"
+  ]);
+}
+function b64ToBytes(b64) {
+  // Accept both base64 and base64url
+  let s = (b64 || "").replace(/-/g, "+").replace(/_/g, "/").trim();
+  while(s.length % 4)s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++)out[i] = bin.charCodeAt(i);
+  return out;
+}
+function parseSignatureHeader(h) {
+  if (!h) return null;
+  // format: t=<ms>,v0=<base64>
+  const parts = Object.fromEntries(h.split(",").map((p)=>p.trim().split("=").map((x)=>x.trim())));
+  const t = parts["t"];
+  const v0 = parts["v0"];
+  const tsNum = Number(t);
+  if (!t || !v0 || !Number.isFinite(tsNum)) return null;
+  return {
+    t,
+    tsNum,
+    v0
+  };
+}
+/* ===== DB ingest (same shape you already use) ===== */ async function saveEvent(evt) {
+  const row = {
+    event_id: evt.event_id ?? evt.id ?? null,
+    event_category: evt.event_category ?? evt.category ?? null,
+    event_type: evt.event_type ?? evt.type ?? null,
+    event_object_id: evt.event_object_id ?? evt?.kyc_link?.id ?? evt?.transfer?.id ?? evt?.object?.id ?? null,
+    event_object_status: evt.event_object_status ?? evt?.kyc_link?.kyc_status ?? evt?.transfer?.status ?? evt?.object?.status ?? null,
+    payload: evt
+  };
+  if (row.event_id) {
+    await sb.from("bridge_webhook_events").upsert(row, {
+      onConflict: "event_id",
+      ignoreDuplicates: true
+    }).catch(()=>{});
+  } else {
+    await sb.from("bridge_webhook_events").insert(row).catch(()=>{});
+  }
+}
+/* ===== Business updates (your existing logic) ===== */ async function applyKycUpdate(kyc) {
+  if (!kyc) return;
+  const patch = {
+    kyc_status: kyc.kyc_status ?? kyc.status ?? null,
+    payer_bridge_customer_id: kyc.customer_id ?? null,
+    kyc_link: kyc.kyc_link ?? null,
+    tos_link: kyc.tos_link ?? null,
+    updated_at: new Date().toISOString()
+  };
+  if (kyc.id) {
+    const { error } = await sb.from("payment_requests").update({
+      ...patch,
+      kyc_link_id: kyc.id
+    }).eq("kyc_link_id", kyc.id);
+    if (!error) return;
+  }
+  if (kyc.customer_id) {
+    await sb.from("payment_requests").update(patch).eq("payer_bridge_customer_id", kyc.customer_id);
+  }
+}
+async function applyTransferUpdate(tx) {
+  if (!tx) return;
+  const patch = {
+    status: tx.status ?? null,
+    updated_at: new Date().toISOString()
+  };
+  if (tx.deposit_instructions) patch.deposit_instructions = tx.deposit_instructions;
+  const prId = tx.metadata?.payment_request_id;
+  if (prId) {
+    await sb.from("payment_requests").update({
+      ...patch,
+      transfer_id: tx.id ?? null
+    }).eq("id", prId);
+    return;
+  }
+  if (tx.id) await sb.from("payment_requests").update(patch).eq("transfer_id", tx.id);
+}
+/* ===== Server ===== */ Deno.serve(async (req)=>{
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "content-type,x-webhook-signature,X-Webhook-Signature",
+        "Access-Control-Allow-Methods": "POST,OPTIONS"
+      }
+    });
+  }
+  if (req.method !== "POST") return new Response("Method not allowed", {
+    status: 405
+  });
+  if (!RAW_PEM) {
+    console.error("Missing BRIDGE_WEBHOOK_PUBLIC_KEY");
+    return new Response("ok", {
+      status: 200
+    }); // avoid retries while you fix secrets
+  }
+  const raw = await req.text();
+  const sigHeader = req.headers.get("X-Webhook-Signature") ?? req.headers.get("x-webhook-signature");
+  try {
+    const parsed = parseSignatureHeader(sigHeader);
+    if (!parsed) {
+      if (DEBUG) console.warn("Bad signature header:", sigHeader);
+      return new Response("bad signature header", {
+        status: 400
+      });
+    }
+    // replay guard (10 minutes)
+    if (Date.now() - parsed.tsNum > 10 * 60 * 1000) return new Response("stale", {
+      status: 400
+    });
+    const data = new TextEncoder().encode(`${parsed.t}.${raw}`);
+    const sigBytes = b64ToBytes(parsed.v0);
+    const pub = await importRsaKey(RAW_PEM);
+    const ok = await crypto.subtle.verify({
+      name: "RSASSA-PKCS1-v1_5"
+    }, pub, sigBytes, data);
+    if (!ok) {
+      if (DEBUG) {
+        console.warn("Signature verify failed", {
+          t: parsed.t,
+          v0len: parsed.v0.length,
+          bodyLen: raw.length,
+          bodyStart: raw.slice(0, 120)
+        });
+      }
+      return new Response("bad sig", {
+        status: 400
+      });
+    }
+    const evt = JSON.parse(raw);
+    await saveEvent(evt);
+    const kyc = evt?.kyc_link ?? evt?.data?.kyc_link ?? (evt?.object?.type === "kyc_link" ? evt.object : null);
+    const transfer = evt?.transfer ?? evt?.data?.transfer ?? (evt?.object?.type === "transfer" ? evt.object : null);
+    if (kyc) await applyKycUpdate(kyc);
+    if (transfer) await applyTransferUpdate(transfer);
+    return new Response("ok", {
+      status: 200
+    });
+  } catch (e) {
+    console.error("[bridge-webhook] error:", e);
+    // Return 200 to prevent Bridge retry storms while you debug.
+    return new Response("ok", {
+      status: 200
+    });
+  }
+});
 
