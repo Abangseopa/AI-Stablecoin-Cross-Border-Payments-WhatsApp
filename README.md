@@ -7,19 +7,21 @@ The sender chats → enters payout → WhatsApp bot calls Supabase → bridge AP
 ### Screenshots
 
 #### Recipient Flow (WhatsApp)
+
 | Step | Screenshot |
-|---|---|
-| Receive payment link + onboarding | ![page1](screenshots/page1.png) |
-| Enter payout details | ![page2](screenshots/page2.png) |
-| Confirm details | ![page3](screenshots/page3.png) |
-| Recipient ready → funds incoming | ![page4](screenshots/page4.png) |
+|------|------------|
+| Onboarding | <img src="./screenshots/page1.png" width="280"/> |
+| Enter amount | <img src="./screenshots/page2.png" width="280"/> |
+| Confirm payout details | <img src="./screenshots/page3.png" width="280"/> |
+| Recipient ready → funds incoming | <img src="./screenshots/page4.png" width="280"/> |
 
 #### Sender Flow (WhatsApp)
+
 | Step | Screenshot |
-|---|---|
-| Enter payout amount conversationally | ![page5](screenshots/page5.png) |
-| Confirm + authorize | ![page6](screenshots/page6.png) |
-| Settlement triggered instantly | ![page7](screenshots/page7.png) |
+|------|------------|
+| Review payment request | <img src="./screenshots/page5.png" width="280"/> |
+| Confirm + authorize | <img src="./screenshots/page6.png" width="280"/> |
+| Settlement triggered instantly | <img src="./screenshots/page7.png" width="280"/> |
 
 
 ### Architecture
