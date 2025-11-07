@@ -32,4 +32,4 @@ The sender chats → enters payout → WhatsApp bot calls Supabase → bridge AP
 | `/backend/config.toml` + `demo.json` | Local testing config + sample payloads |
 
 ### Why this mattered
-Traditional cross-border flows are slow and expensive. Stablecoins + messaging made it instant, lightweight and UX-native. 
+Traditional cross-border flows are slow and expensive. Stablecoins + messaging made it instant, lightweight and UX-native. We originally targetted the Global <> South Africa flow - due to our particular founder market fit and access to early users. 
